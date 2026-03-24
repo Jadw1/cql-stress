@@ -4,6 +4,7 @@ extern crate async_trait;
 mod hdr_logger;
 mod java_generate;
 mod operation;
+mod raft_leader_policy;
 mod settings;
 mod stats;
 
@@ -32,6 +33,7 @@ use operation::{
 use scylla::client::execution_profile::ExecutionProfile;
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
+use scylla::policies::load_balancing::LoadBalancingPolicy;
 use stats::{ShardedStats, StatsFactory, StatsPrinter};
 
 use std::{env, sync::Arc};
@@ -164,8 +166,25 @@ async fn prepare_run(
         builder = builder.tls_context(Some(ssl_ctx));
     }
 
+    // Determine the target table for raft leader routing
+    let target_table = match settings.command {
+        Command::CounterWrite | Command::CounterRead => "counter1",
+        _ => "standard1",
+    };
+    let target_keyspace = settings.schema.keyspace.clone();
+
+    // Create the RaftLeaderPolicy wrapping the default policy.
+    // The policy is created with an empty mapping; it will be populated
+    // after the session is built and the schema is created.
+    let default_policy = settings.node.load_balancing_policy();
+    let raft_policy = Arc::new(raft_leader_policy::RaftLeaderPolicy::new(
+        target_keyspace,
+        target_table.to_string(),
+        default_policy,
+    ));
+
     let default_exec_profile = ExecutionProfile::builder()
-        .load_balancing_policy(settings.node.load_balancing_policy())
+        .load_balancing_policy(Arc::clone(&raft_policy) as Arc<dyn LoadBalancingPolicy>)
         .build();
     builder = builder.default_execution_profile_handle(default_exec_profile.into_handle());
 
@@ -183,6 +202,14 @@ async fn prepare_run(
         .create_schema(&session)
         .await
         .context("Failed to create schema")?;
+
+    // Initialize the raft leader policy by querying system.tablets
+    // and the ScyllaDB REST API to build the token -> leader mapping.
+    let api_node = raft_leader_policy::extract_host(&settings.node.nodes[0]);
+    raft_policy
+        .initialize(&session, api_node, 10000)
+        .await
+        .context("Failed to initialize raft leader routing")?;
 
     let duration = settings.command_params.common.duration;
 
