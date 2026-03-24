@@ -24,9 +24,9 @@ use uuid::Uuid;
 pub struct RaftLeaderPolicy {
     target_keyspace: String,
     target_table: String,
-    /// Mapping from last_token -> leader host_id.
+    /// Mapping from last_token -> (leader host_id, shard).
     /// Populated after session creation via `initialize()`.
-    token_to_leader: OnceLock<BTreeMap<i64, Uuid>>,
+    token_to_leader: OnceLock<BTreeMap<i64, (Uuid, Shard)>>,
     /// Fallback policy for non-target-table queries or when not yet initialized.
     default_policy: Arc<dyn LoadBalancingPolicy>,
 }
@@ -66,14 +66,14 @@ impl RaftLeaderPolicy {
             get_table_id(session, &self.target_keyspace, &self.target_table).await?;
         println!("  Table ID: {}", table_id);
 
-        // Step 2: Get token -> raft_group_id mapping from system.tablets
+        // Step 2: Get token -> (raft_group_id, replicas) mapping from system.tablets
         let tablet_info = get_tablet_info(session, table_id).await?;
         println!("  Found {} tablets", tablet_info.len());
 
         // Step 3: For each unique raft_group_id, get the leader host_id via REST API
         let http_client = reqwest::Client::new();
         let unique_groups: std::collections::HashSet<Uuid> =
-            tablet_info.iter().map(|(_, group_id)| *group_id).collect();
+            tablet_info.iter().map(|t| t.raft_group_id).collect();
         println!(
             "  Querying raft leaders for {} groups...",
             unique_groups.len()
@@ -93,11 +93,27 @@ impl RaftLeaderPolicy {
             group_to_leader.insert(*group_id, leader_host_id);
         }
 
-        // Build the final token -> leader host_id mapping
+        // Build the final token -> (leader host_id, shard) mapping.
+        // For each tablet, find the replica on the leader host to get the shard.
         let mut token_to_leader = BTreeMap::new();
-        for (last_token, group_id) in &tablet_info {
-            if let Some(&leader) = group_to_leader.get(group_id) {
-                token_to_leader.insert(*last_token, leader);
+        for tablet in &tablet_info {
+            if let Some(&leader_host_id) = group_to_leader.get(&tablet.raft_group_id) {
+                let shard = tablet
+                    .replicas
+                    .iter()
+                    .find(|(host_id, _)| *host_id == leader_host_id)
+                    .map(|(_, shard)| *shard as Shard)
+                    .with_context(|| {
+                        format!(
+                            "Leader {} not found in replicas for tablet with last_token {}",
+                            leader_host_id, tablet.last_token
+                        )
+                    })?;
+                println!(
+                    "    Token {} -> Host {} Shard {}",
+                    tablet.last_token, leader_host_id, shard
+                );
+                token_to_leader.insert(tablet.last_token, (leader_host_id, shard));
             }
         }
 
@@ -113,13 +129,13 @@ impl RaftLeaderPolicy {
         Ok(())
     }
 
-    /// Find the leader host_id for a given token.
+    /// Find the leader host_id and shard for a given token.
     ///
     /// Uses the BTreeMap to find the tablet whose range contains the token.
     /// The tablet ranges are defined by `last_token` boundaries:
     /// a token T belongs to the tablet with the smallest `last_token >= T`.
     /// If T is beyond the largest `last_token`, it wraps around to the first tablet.
-    fn find_leader_host_id(&self, token_value: i64) -> Option<Uuid> {
+    fn find_leader(&self, token_value: i64) -> Option<(Uuid, Shard)> {
         let map = self.token_to_leader.get()?;
         if map.is_empty() {
             return None;
@@ -127,7 +143,7 @@ impl RaftLeaderPolicy {
         // Find the first tablet whose last_token >= the given token
         map.range(token_value..)
             .next()
-            .map(|(_, &uuid)| uuid)
+            .map(|(_, target)| *target)
             // Wrap around: if token > max last_token, use the first tablet
             .or_else(|| map.values().next().copied())
     }
@@ -142,16 +158,17 @@ impl RaftLeaderPolicy {
         }
     }
 
-    /// Find a node in the cluster by its host_id.
+    /// Find a node in the cluster by its host_id, paired with a specific shard.
     fn find_node_by_host_id<'a>(
         host_id: Uuid,
+        shard: Shard,
         cluster: &'a ClusterState,
     ) -> Option<(NodeRef<'a>, Option<Shard>)> {
         cluster
             .get_nodes_info()
             .iter()
             .find(|node| node.host_id == host_id)
-            .map(|node| (node, None))
+            .map(|node| (node, Some(shard)))
     }
 }
 
@@ -161,11 +178,11 @@ impl LoadBalancingPolicy for RaftLeaderPolicy {
         request: &'a RoutingInfo,
         cluster: &'a ClusterState,
     ) -> Option<(NodeRef<'a>, Option<Shard>)> {
-        // For the target table, try to route to the raft leader
+        // For the target table, try to route to the raft leader + shard
         if self.is_target_table(request) {
             if let Some(token) = request.token {
-                if let Some(leader_id) = self.find_leader_host_id(token.value()) {
-                    if let Some(result) = Self::find_node_by_host_id(leader_id, cluster) {
+                if let Some((leader_id, shard)) = self.find_leader(token.value()) {
+                    if let Some(result) = Self::find_node_by_host_id(leader_id, shard, cluster) {
                         return Some(result);
                     }
                 }
@@ -213,12 +230,20 @@ async fn get_table_id(session: &Session, keyspace: &str, table: &str) -> Result<
     Ok(table_id)
 }
 
-/// Query system.tablets to get (last_token, raft_group_id) pairs for a table.
-async fn get_tablet_info(session: &Session, table_id: Uuid) -> Result<Vec<(i64, Uuid)>> {
+/// Information about a single tablet from system.tablets.
+struct TabletInfo {
+    last_token: i64,
+    raft_group_id: Uuid,
+    /// Replicas as (host_id, shard) pairs.
+    replicas: Vec<(Uuid, i32)>,
+}
+
+/// Query system.tablets to get tablet info including replicas for a table.
+async fn get_tablet_info(session: &Session, table_id: Uuid) -> Result<Vec<TabletInfo>> {
     // Format the UUID directly in the query since system virtual tables
     // may not support bind markers well.
     let query = format!(
-        "SELECT last_token, raft_group_id FROM system.tablets WHERE table_id = {}",
+        "SELECT last_token, raft_group_id, replicas FROM system.tablets WHERE table_id = {}",
         table_id
     );
 
@@ -232,10 +257,14 @@ async fn get_tablet_info(session: &Session, table_id: Uuid) -> Result<Vec<(i64, 
         .context("Expected rows result from system.tablets")?;
 
     let mut tablet_info = Vec::new();
-    for row in rows.rows::<(i64, Uuid)>()? {
-        let (last_token, raft_group_id) =
+    for row in rows.rows::<(i64, Uuid, Vec<(Uuid, i32)>)>()? {
+        let (last_token, raft_group_id, replicas) =
             row.context("Failed to deserialize tablet row")?;
-        tablet_info.push((last_token, raft_group_id));
+        tablet_info.push(TabletInfo {
+            last_token,
+            raft_group_id,
+            replicas,
+        });
     }
 
     Ok(tablet_info)
@@ -332,25 +361,25 @@ mod tests {
         let uuid_c = Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
 
         let mut map = BTreeMap::new();
-        map.insert(-3000, uuid_a); // tablet A: ...-3000
-        map.insert(0, uuid_b); // tablet B: -2999...0
-        map.insert(3000, uuid_c); // tablet C: 1...3000
+        map.insert(-3000, (uuid_a, 0u32)); // tablet A: ...-3000, shard 0
+        map.insert(0, (uuid_b, 1u32)); // tablet B: -2999...0, shard 1
+        map.insert(3000, (uuid_c, 2u32)); // tablet C: 1...3000, shard 2
 
         policy.token_to_leader.set(map).unwrap();
 
         // Token -5000 -> tablet A (first range)
-        assert_eq!(policy.find_leader_host_id(-5000), Some(uuid_a));
+        assert_eq!(policy.find_leader(-5000), Some((uuid_a, 0)));
         // Token -3000 -> tablet A (boundary)
-        assert_eq!(policy.find_leader_host_id(-3000), Some(uuid_a));
+        assert_eq!(policy.find_leader(-3000), Some((uuid_a, 0)));
         // Token -2999 -> tablet B
-        assert_eq!(policy.find_leader_host_id(-2999), Some(uuid_b));
+        assert_eq!(policy.find_leader(-2999), Some((uuid_b, 1)));
         // Token 0 -> tablet B (boundary)
-        assert_eq!(policy.find_leader_host_id(0), Some(uuid_b));
+        assert_eq!(policy.find_leader(0), Some((uuid_b, 1)));
         // Token 1 -> tablet C
-        assert_eq!(policy.find_leader_host_id(1), Some(uuid_c));
+        assert_eq!(policy.find_leader(1), Some((uuid_c, 2)));
         // Token 3000 -> tablet C (boundary)
-        assert_eq!(policy.find_leader_host_id(3000), Some(uuid_c));
+        assert_eq!(policy.find_leader(3000), Some((uuid_c, 2)));
         // Token 5000 -> wraps around to tablet A
-        assert_eq!(policy.find_leader_host_id(5000), Some(uuid_a));
+        assert_eq!(policy.find_leader(5000), Some((uuid_a, 0)));
     }
 }
