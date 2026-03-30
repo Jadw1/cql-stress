@@ -85,7 +85,7 @@ impl SchemaOption {
 
     pub fn construct_keyspace_creation_query(&self) -> String {
         format!(
-            "CREATE KEYSPACE IF NOT EXISTS \"{keyspace}\" WITH REPLICATION = {replication};",
+            "CREATE KEYSPACE IF NOT EXISTS \"{keyspace}\" WITH REPLICATION = {replication} AND consistency = 'local';",
             keyspace = self.keyspace,
             replication = self.construct_replication_string()
         )
