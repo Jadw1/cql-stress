@@ -52,7 +52,7 @@ jobs:
       - name: Build and Cache Image for the ${{ matrix.build.platform }} platform
         run: |
           docker buildx build \
-            -t scylladb/cql-stress \
+            -t jadw1/cql-stress \
             --platform ${{ matrix.build.platform }} \
             --provenance false \
             --metadata-file metadata \
@@ -104,14 +104,14 @@ jobs:
           SHA_ARM=$(cat digests/digest-arm/digest-arm)
           echo SHA_AMD=$SHA_AMD
           echo SHA_ARM=$SHA_ARM
-          docker manifest create scylladb/cql-stress:${{ inputs.version }} \
-            --amend scylladb/cql-stress@$SHA_AMD \
-            --amend scylladb/cql-stress@$SHA_ARM
-          docker manifest push scylladb/cql-stress:${{ inputs.version }}
-          docker manifest inspect scylladb/cql-stress:${{ inputs.version }}
+          docker manifest create jadw1/cql-stress:${{ inputs.version }} \
+            --amend jadw1/cql-stress@$SHA_AMD \
+            --amend jadw1/cql-stress@$SHA_ARM
+          docker manifest push jadw1/cql-stress:${{ inputs.version }}
+          docker manifest inspect jadw1/cql-stress:${{ inputs.version }}
 
-          docker manifest create scylladb/cql-stress:latest \
-            --amend scylladb/cql-stress@$SHA_AMD \
-            --amend scylladb/cql-stress@$SHA_ARM
-          docker manifest push scylladb/cql-stress:latest
-          docker manifest inspect scylladb/cql-stress:latest
+          docker manifest create jadw1/cql-stress:latest \
+            --amend jadw1/cql-stress@$SHA_AMD \
+            --amend jadw1/cql-stress@$SHA_ARM
+          docker manifest push jadw1/cql-stress:latest
+          docker manifest inspect jadw1/cql-stress:latest
