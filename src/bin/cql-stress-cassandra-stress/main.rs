@@ -30,16 +30,19 @@ use operation::{
     CounterReadOperationFactory, CounterWriteOperationFactory, MixedOperationFactory,
     WriteOperationFactory,
 };
+use scylla::client::PoolSize;
 use scylla::client::execution_profile::ExecutionProfile;
 use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use scylla::policies::load_balancing::LoadBalancingPolicy;
 use stats::{ShardedStats, StatsFactory, StatsPrinter};
 
-use std::{env, sync::Arc};
+use std::{env, sync::Arc, time::Duration};
 use tracing_subscriber::EnvFilter;
 
 use settings::{CassandraStressParsingResult, CassandraStressSettings};
+
+const SHARD_AWARE_POOL_WARMUP: Duration = Duration::from_secs(2);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -211,6 +214,8 @@ async fn prepare_run(
         .await
         .context("Failed to initialize raft leader routing")?;
 
+    wait_for_per_shard_pool_warmup(&settings.mode.pool_size).await;
+
     let duration = settings.command_params.common.duration;
 
     let (concurrency, throttle) = match settings.rate.threads_info {
@@ -232,6 +237,16 @@ async fn prepare_run(
         // TODO: adjust when -errors option is supported
         max_retries_per_op: 9,
     })
+}
+
+async fn wait_for_per_shard_pool_warmup(pool_size: &PoolSize) {
+    if matches!(pool_size, PoolSize::PerShard(_)) {
+        println!(
+            "Waiting {:?} for shard-aware pools to warm up...",
+            SHARD_AWARE_POOL_WARMUP
+        );
+        tokio::time::sleep(SHARD_AWARE_POOL_WARMUP).await;
+    }
 }
 
 async fn create_operation_factory(
